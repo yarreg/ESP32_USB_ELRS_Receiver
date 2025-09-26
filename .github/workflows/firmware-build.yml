@@ -1,0 +1,126 @@
+# Build ESP-IDF firmware for ESP32-S3 (and optional future targets)
+# Caches the IDF tools & Python deps, uploads artifacts (.elf, .bin, map, merged binary)
+# Manual dispatch allows selecting target.
+
+name: Firmware
+
+on:
+  push:
+    branches: [ master, main ]
+  pull_request:
+    branches: [ master, main ]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'ESP-IDF chip target (override matrix)'
+        required: false
+        default: 'esp32s3'
+      idf_version:
+        description: 'esp-idf version (override)'
+        required: false
+        default: 'v5.5.1'
+
+# Reduce noise on simultaneous pushes
+concurrency:
+  group: firmware-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build (${{ matrix.target }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [ esp32s3 ]  # add esp32s2, esp32p4 later if needed
+    env:
+      IDF_VERSION: v5.5.1
+    steps:
+      - name: Override matrix from dispatch (optional)
+        if: github.event_name == 'workflow_dispatch' && inputs.target != ''
+        run: echo "Matrix override not implemented (single build path). Selected target=${{ inputs.target }}"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Cache esp-idf tools
+        id: cache-idf
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: idf-tools-${{ runner.os }}-${{ env.IDF_VERSION }}-${{ hashFiles('**/idf_component.yml', 'dependencies.lock') }}
+
+      - name: Install ESP-IDF (clone)
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${IDF_VERSION} https://github.com/espressif/esp-idf.git $HOME/esp-idf
+          cd $HOME/esp-idf
+          ./install.sh esp32s3
+
+      - name: Export ESP-IDF
+        run: |
+          if [ ! -d "$HOME/esp-idf" ]; then
+            git clone --depth 1 --branch ${IDF_VERSION} https://github.com/espressif/esp-idf.git $HOME/esp-idf
+          fi
+          . $HOME/esp-idf/export.sh
+          idf.py --version
+        shell: bash
+
+      - name: Configure target
+        run: |
+          . $HOME/esp-idf/export.sh
+          idf.py set-target ${{ matrix.target }}
+        shell: bash
+
+      - name: Build
+        run: |
+          . $HOME/esp-idf/export.sh
+          idf.py build
+        shell: bash
+
+      - name: Collect artifacts
+        run: |
+          mkdir -p artifacts
+          cp build/*.bin artifacts/ || true
+          cp build/*.elf artifacts/ || true
+          cp build/*.map artifacts/ || true
+          ls -l artifacts
+        shell: bash
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: firmware-${{ matrix.target }}
+            
+          path: artifacts
+          if-no-files-found: error
+
+  # Optional job to create release when tag pushed like v1.2.3
+  release:
+    name: Release tag
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: firmware-esp32s3
+          path: release_artifacts
+
+      - name: Generate checksum
+        run: |
+          cd release_artifacts
+          sha256sum * > SHA256SUMS.txt || shasum -a256 * > SHA256SUMS.txt
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release_artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

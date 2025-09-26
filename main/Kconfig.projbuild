@@ -1,0 +1,11 @@
+menu "SBUS Receiver Options"
+
+config SBUS_UART_RX_GPIO
+    int "SBUS UART RX GPIO"
+    range 0 48
+    default 1
+    help
+      GPIO number used for SBUS inverted UART RX.
+      Default 1. Change to match your wiring.
+
+endmenu

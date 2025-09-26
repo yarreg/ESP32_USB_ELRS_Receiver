@@ -1,0 +1,106 @@
+name: Parameterized Firmware
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Chip target (esp32s3, esp32s2, esp32p4)'
+        required: true
+        default: 'esp32s3'
+      idf_version:
+        description: 'ESP-IDF version tag'
+        required: true
+        default: 'v5.5.1'
+      sbus_gpio:
+        description: 'SBUS UART RX GPIO (CONFIG_SBUS_UART_RX_GPIO)'
+        required: true
+        default: '1'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    env:
+      IDF_VERSION: ${{ inputs.idf_version }}
+      TARGET: ${{ inputs.target }}
+      SBUS_GPIO: ${{ inputs.sbus_gpio }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Prepare dynamic defaults
+        id: dyn
+        run: |
+          echo 'Generating dynamic sdkconfig defaults'
+          cat > dynamic.defaults <<EOF
+          CONFIG_IDF_TARGET=${TARGET}
+          CONFIG_SBUS_UART_RX_GPIO=${SBUS_GPIO}
+          EOF
+          echo '---- dynamic.defaults ----'
+          sed -e 's/^/  /' dynamic.defaults
+          # Compose list of defaults: repo first, then dynamic so dynamic overrides
+          echo "SDKCONFIG_DEFAULTS=sdkconfig.defaults dynamic.defaults" >> $GITHUB_ENV
+          NAME=firmware-${TARGET}-gpio${SBUS_GPIO}
+          echo "APP_ARTIFACT=${NAME}" >> $GITHUB_ENV
+
+      - name: Cache esp-idf tools
+        id: cache-idf
+        uses: actions/cache@v4
+        with:
+          path: ~/.espressif
+          key: idf-tools-${{ runner.os }}-${{ env.IDF_VERSION }}-${{ hashFiles('**/idf_component.yml', 'dependencies.lock') }}
+
+      - name: Install ESP-IDF (clone if cache miss)
+        if: steps.cache-idf.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch ${IDF_VERSION} https://github.com/espressif/esp-idf.git $HOME/esp-idf
+          cd $HOME/esp-idf
+          ./install.sh $TARGET
+
+      - name: Export ESP-IDF
+        run: |
+          if [ ! -d "$HOME/esp-idf" ]; then
+            git clone --depth 1 --branch ${IDF_VERSION} https://github.com/espressif/esp-idf.git $HOME/esp-idf
+          fi
+          . $HOME/esp-idf/export.sh
+          idf.py --version
+        shell: bash
+
+      - name: Configure & Build
+        run: |
+          . $HOME/esp-idf/export.sh
+          rm -f sdkconfig
+          echo "Using SDKCONFIG_DEFAULTS=$SDKCONFIG_DEFAULTS"
+          idf.py set-target ${TARGET}
+          idf.py reconfigure
+          idf.py build
+        shell: bash
+
+      - name: Collect Artifacts
+        run: |
+          mkdir -p artifacts
+          cp build/*.bin artifacts/ || true
+          cp build/*.elf artifacts/ || true
+          cp build/*.map artifacts/ || true
+          sha256sum artifacts/* > artifacts/SHA256SUMS.txt || shasum -a256 artifacts/* > artifacts/SHA256SUMS.txt
+          ls -l artifacts
+        shell: bash
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.APP_ARTIFACT }}
+          path: artifacts
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          echo "Artifact name: $APP_ARTIFACT" >> $GITHUB_STEP_SUMMARY
+          echo "Target: $TARGET" >> $GITHUB_STEP_SUMMARY
+          echo "SBUS GPIO: $SBUS_GPIO" >> $GITHUB_STEP_SUMMARY
+          echo '\nDynamic defaults:' >> $GITHUB_STEP_SUMMARY
+          sed -e 's/^/    /' dynamic.defaults >> $GITHUB_STEP_SUMMARY
+        shell: bash
